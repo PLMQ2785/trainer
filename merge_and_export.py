@@ -1,6 +1,6 @@
 """
 [방법 B] 어댑터 병합 및 단일 모델 저장 스크립트
-- LoRA 어댑터를 베이스 모델에 흡수시켜 완전한 단일 모델로 저장
+- LoRA 어댑터를 베이스 모델에 흡수시켜 단일 모델로 저장
 - vLLM / TGI / Ollama 등 서빙 인프라 배포용
 - 사용법: uv run python merge_and_export.py --config config.yaml
 - 옵션  : --output_dir ./outputs/merged_model  (기본: output_dir + "_merged")
