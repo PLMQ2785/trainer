@@ -1,0 +1,30 @@
+# ---------------------------------------------------------
+# 파인튜닝 작업 설정
+# ---------------------------------------------------------
+job_name: "test_run_gemma3_12b_v1"
+
+model:
+  name_or_path: "google/gemma-3-12b-it"      # 다른 모델로 변경 가능
+  use_flash_attention: true                  # flash_attn 사용여부 설정, true로 설정시 학습 속도 향상 및 메모리 사용량 감소
+  torch_dtype: "bfloat16"                    # 가중치 타입 bfloat16 고정
+
+dataset:
+  path: "./data/sample_dataset.jsonl"        # 서버에 올려둔 데이터셋 경로
+  text_column: "text"                        # JSONL 파일 내에서 학습할 텍스트가 들어있는 키 값
+
+training:
+  output_dir: "./outputs/test_run_gemma3_12b_v1" # 가중치가 저장될 결과 폴더
+  
+  # [학습 속도 및 메모리 설정]
+  per_device_train_batch_size: 16            # H200에선 16~32 이상으로 올려도 VRAM여유가 있으니 크게 문제 없어보임. (GPU 1개당 1스텝 처리할 샘플 수)
+  gradient_accumulation_steps: 2             # VRAM 부족할 때만 늘리고, 평소엔 작게 유지 (그래디언트를 여러 미니배치에 누적하고 한번에 가중치 업데이트 하므로 배치사이즈를 크게 한거랑 같은 효과)
+  
+  # [학습 하이퍼파라미터]
+  learning_rate: 2.0e-5                      # 학습률
+  num_train_epochs: 3                        # 학습 에포크 수 (전체 몇번 반복할지)
+  logging_steps: 10                          # 학습 로그 출력 빈도 (몇 스텝마다 로깅할지)
+  max_seq_length: 2048                       # 문맥 길이 (긴 문서 학습시 4096, 8192 등으로 조절하면 됨, 입력 최대 토큰 길이 이보다 길면 잘림, 크면 더 많은 입력을 한번에 쓰지만 VRAM을 많이 쓰게됨)
+  
+  # [LoRA (PEFT) 세밀 조정]
+  lora_r: 16                                 # 기본 16. 모델이 많이 변해야 하는 어려운 태스크면 32, 64 (LORA 행렬 차원수 설정, 크면 표현력도 좋아지지만 파라미터도 커지고 VRAM도 커짐)
+  lora_alpha: 32                             # 보통 lora_r의 2배로 설정 (LORA 스케일링 계수, 클수록 학습이 더 강하게됨)

@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# 데이터셋 (용량 큼)
+data/
+
+# 학습 결과물 (체크포인트, 병합 모델 등, 용량 큼)
+outputs/
