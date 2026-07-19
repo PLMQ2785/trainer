@@ -1,110 +1,127 @@
+"""Unsloth 기반 범용 QLoRA SFT 학습 스크립트."""
+
 import argparse
+from pathlib import Path
+
 import yaml
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from unsloth import FastModel, is_bfloat16_supported
 from datasets import load_dataset
-from trl import SFTTrainer, SFTConfig
-from peft import LoraConfig
+from trl import SFTConfig, SFTTrainer
 
 
-# token_type_ids를 학습 시 필수로 요구하는 모델 목록
-# (Gemma3는 Vision-Language 모델이라 텍스트/이미지 토큰 구분용으로 필요)
-_MODELS_REQUIRING_TOKEN_TYPE_IDS = frozenset({"gemma3"})
+DEFAULT_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
 
 
-class MultiModelSFTTrainer(SFTTrainer):
-    """
-    다양한 모델을 범용 지원하는 SFTTrainer.
-    token_type_ids 등 모델별 특수 입력이 필요한 경우 자동으로 처리합니다.
-    - Gemma3: token_type_ids (0=텍스트, 1=이미지) 필수 → 텍스트 학습 시 zeros 주입
-    - Llama/Qwen/Mistral 등: 추가 입력 불필요, 건드리지 않음
-    """
-    def training_step(self, model, inputs, num_items_in_batch=None):
-        model_type = getattr(getattr(model, "config", None), "model_type", "")
-        if model_type in _MODELS_REQUIRING_TOKEN_TYPE_IDS:
-            if "token_type_ids" not in inputs:
-                inputs["token_type_ids"] = torch.zeros_like(inputs["input_ids"])
-        return super().training_step(model, inputs, num_items_in_batch)
+def load_config(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as file:
+        return yaml.safe_load(file)
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True, help="Path to yaml config")
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Unsloth QLoRA SFT trainer")
+    parser.add_argument("--config", required=True, help="Path to YAML config")
     args = parser.parse_args()
 
-    with open(args.config, 'r', encoding='utf-8') as f:
-        cfg = yaml.safe_load(f)
+    cfg = load_config(args.config)
+    model_cfg = cfg["model"]
+    dataset_cfg = cfg["dataset"]
+    training_cfg = cfg["training"]
+
+    model_name = model_cfg["name_or_path"]
+    output_dir = Path(training_cfg["output_dir"])
+    max_seq_length = int(training_cfg.get("max_seq_length", 2048))
+    seed = int(training_cfg.get("seed", 3407))
+    load_in_4bit = bool(model_cfg.get("load_in_4bit", True))
 
     print(f"========== [{cfg['job_name']}] ==========")
-    print(f"Target Model: {cfg['model']['name_or_path']}")
+    print(f"Target Model : {model_name}")
+    print(f"Training     : {'QLoRA (4-bit)' if load_in_4bit else 'LoRA (16-bit)'}")
+    print(f"Adapter Path : {output_dir}")
 
-    # 1. 범용 토크나이저 로드 (trust_remote_code 적용)
-    tokenizer = AutoTokenizer.from_pretrained(
-        cfg['model']['name_or_path'],
-        trust_remote_code=True
-    )
-    
-    # Pad 토큰이 없는 모델(Llama3, Gemma 등)을 위한 방어 로직
-    if tokenizer.pad_token is None:
-        if tokenizer.eos_token:
-            tokenizer.pad_token = tokenizer.eos_token
-        else:
-            tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-
-    # TRL 1.0: max_seq_length는 SFTConfig에 없음 → tokenizer.model_max_length으로 설정
-    tokenizer.model_max_length = cfg['training'].get('max_seq_length', 2048)
-
-    # 2. 범용 모델 로드 (H100/H200 최적화 및 trust_remote_code 적용)
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg['model']['name_or_path'],
-        dtype=torch.bfloat16,  # bfloat16 (torch_dtype은 TRL 1.0+ deprecated)
-        attn_implementation="flash_attention_2" if cfg['model'].get('use_flash_attention', True) else "sdpa",
-        trust_remote_code=True,
-        device_map="auto"
-    )
-    
-    # Pad 토큰을 새로 추가했다면 모델 임베딩 사이즈도 늘려줍니다.
-    if tokenizer.pad_token == '[PAD]':
-         model.resize_token_embeddings(len(tokenizer))
-
-    # 3. 데이터셋 로드
-    dataset = load_dataset("json", data_files=cfg['dataset']['path'], split="train")
-
-    # 4. 범용 PEFT(LoRA) 설정: 어떤 모델이든 'all-linear'로 자동 매핑
-    peft_config = LoraConfig(
-        r=cfg['training'].get('lora_r', 16),
-        lora_alpha=cfg['training'].get('lora_alpha', 32),
-        lora_dropout=0.05,
-        target_modules="all-linear", # 핵심: 모델 아키텍처 상관없이 모든 Linear 레이어 타겟팅
-        task_type="CAUSAL_LM",
+    model, tokenizer = FastModel.from_pretrained(
+        model_name=model_name,
+        max_seq_length=max_seq_length,
+        dtype=None,
+        load_in_4bit=load_in_4bit,
+        load_in_16bit=not load_in_4bit,
+        full_finetuning=False,
+        trust_remote_code=bool(model_cfg.get("trust_remote_code", True)),
     )
 
-    # 5. SFTConfig (TRL 1.0: dataset_text_field는 SFTConfig에, max_seq_length는 tokenizer로 설정)
+    target_modules = training_cfg.get("target_modules", DEFAULT_TARGET_MODULES)
+    model = FastModel.get_peft_model(
+        model,
+        r=int(training_cfg.get("lora_r", 16)),
+        target_modules=target_modules,
+        lora_alpha=int(training_cfg.get("lora_alpha", 32)),
+        lora_dropout=float(training_cfg.get("lora_dropout", 0.0)),
+        bias="none",
+        use_gradient_checkpointing=training_cfg.get(
+            "use_gradient_checkpointing", "unsloth"
+        ),
+        random_state=seed,
+        use_rslora=bool(training_cfg.get("use_rslora", False)),
+        loftq_config=None,
+    )
+
+    dataset = load_dataset(
+        "json",
+        data_files=dataset_cfg["path"],
+        split="train",
+    )
+
+    bf16 = is_bfloat16_supported()
     sft_config = SFTConfig(
-        output_dir=cfg['training']['output_dir'],
-        per_device_train_batch_size=cfg['training']['per_device_train_batch_size'],
-        gradient_accumulation_steps=cfg['training']['gradient_accumulation_steps'],
-        learning_rate=float(cfg['training']['learning_rate']),
-        num_train_epochs=cfg['training']['num_train_epochs'],
-        logging_steps=cfg['training'].get('logging_steps', 10),
-        bf16=True,
-        save_strategy="epoch",
-        report_to="none",
-        dataset_text_field=cfg['dataset']['text_column'],  # SFTConfig에서 관리
+        output_dir=str(output_dir),
+        per_device_train_batch_size=int(
+            training_cfg["per_device_train_batch_size"]
+        ),
+        gradient_accumulation_steps=int(
+            training_cfg["gradient_accumulation_steps"]
+        ),
+        learning_rate=float(training_cfg["learning_rate"]),
+        num_train_epochs=float(training_cfg["num_train_epochs"]),
+        logging_steps=int(training_cfg.get("logging_steps", 10)),
+        warmup_ratio=float(training_cfg.get("warmup_ratio", 0.03)),
+        lr_scheduler_type=training_cfg.get("lr_scheduler_type", "linear"),
+        optim=training_cfg.get("optim", "adamw_8bit"),
+        bf16=bf16,
+        fp16=not bf16,
+        max_length=max_seq_length,
+        packing=bool(training_cfg.get("packing", False)),
+        dataset_text_field=dataset_cfg["text_column"],
+        dataset_num_proc=training_cfg.get("dataset_num_proc"),
+        save_strategy=training_cfg.get("save_strategy", "epoch"),
+        save_total_limit=training_cfg.get("save_total_limit", 2),
+        report_to=training_cfg.get("report_to", "none"),
+        seed=seed,
     )
 
-    # 6. Trainer 초기화 및 실행
-    trainer = MultiModelSFTTrainer(
+    trainer = SFTTrainer(
         model=model,
         train_dataset=dataset,
-        peft_config=peft_config,
         processing_class=tokenizer,
         args=sft_config,
     )
 
-    trainer.train()
-    trainer.save_model(cfg['training']['output_dir'])
-    tokenizer.save_pretrained(cfg['training']['output_dir']) # 토크나이저도 함께 저장 필수
-    print("✅ 학습 및 저장이 완료되었습니다.")
+    trainer.train(
+        resume_from_checkpoint=training_cfg.get("resume_from_checkpoint")
+    )
+
+    # 작은 LoRA 어댑터만 저장합니다. 16-bit 병합과 최종 양자화는 별도 수행합니다.
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(str(output_dir))
+    tokenizer.save_pretrained(str(output_dir))
+    print(f"✅ QLoRA 학습 완료: {output_dir}")
+
 
 if __name__ == "__main__":
     main()
